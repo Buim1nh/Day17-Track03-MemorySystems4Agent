@@ -28,48 +28,102 @@ class BaselineAgent:
         self.config = config or load_config()
         self.force_offline = force_offline
         self.sessions: dict[str, SessionState] = {}
-
-        # TODO: optionally initialize a real LangChain/LangGraph agent when dependencies exist.
-        self.langchain_agent = None
+        self.langchain_agent = self._maybe_build_langchain_agent() if not force_offline else None
 
     def reply(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: return the agent response and token accounting.
-
-        Pseudocode:
-        - If a live agent exists, call the live path.
-        - Otherwise use a deterministic offline path.
-        """
-
-        raise NotImplementedError
+        if self.force_offline or not self.langchain_agent:
+            return self._reply_offline(thread_id, message)
+            
+        from langchain_core.messages import HumanMessage, AIMessage
+        
+        if thread_id not in self.sessions:
+            self.sessions[thread_id] = SessionState()
+        session = self.sessions[thread_id]
+        
+        session.messages.append({"role": "user", "content": message})
+        
+        lc_messages = []
+        for m in session.messages:
+            if m["role"] == "user":
+                lc_messages.append(HumanMessage(content=m["content"]))
+            elif m["role"] == "assistant":
+                lc_messages.append(AIMessage(content=m["content"]))
+                
+        response = self.langchain_agent.invoke(lc_messages)
+        reply_text = str(response.content)
+        
+        # calculate token usage
+        tokens = response.response_metadata.get("token_usage", {}) if hasattr(response, "response_metadata") else {}
+        if tokens and "prompt_tokens" in tokens:
+            prompt_tokens = tokens.get("prompt_tokens", 0)
+            completion_tokens = tokens.get("completion_tokens", 0)
+        else:
+            prompt_tokens = sum(estimate_tokens(m["content"]) for m in session.messages)
+            completion_tokens = estimate_tokens(reply_text)
+            
+        session.token_usage += prompt_tokens + completion_tokens
+        session.prompt_tokens_processed += prompt_tokens
+        
+        session.messages.append({"role": "assistant", "content": reply_text})
+        return {"content": reply_text}
 
     def token_usage(self, thread_id: str) -> int:
-        # TODO: return cumulative agent token count for one thread.
-        raise NotImplementedError
+        session = self.sessions.get(thread_id)
+        return session.token_usage if session else 0
 
     def prompt_token_usage(self, thread_id: str) -> int:
-        # TODO: estimate how much prompt context this baseline kept processing.
-        raise NotImplementedError
+        session = self.sessions.get(thread_id)
+        return session.prompt_tokens_processed if session else 0
 
     def compaction_count(self, thread_id: str) -> int:
         # Baseline has no compact memory.
         return 0
 
     def _reply_offline(self, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: implement a simple offline behavior.
-
-        Suggested behavior:
-        - Store the new user message in the session
-        - Generate a short deterministic reply
-        - Update token counts
-        - Never remember facts across different thread ids
-        """
-
-        raise NotImplementedError
+        if thread_id not in self.sessions:
+            self.sessions[thread_id] = SessionState()
+        
+        session = self.sessions[thread_id]
+        
+        # User message
+        session.messages.append({"role": "user", "content": message})
+        user_tokens = estimate_tokens(message)
+        session.token_usage += user_tokens
+        
+        # Prompt load: sum of all messages in thread BEFORE we reply + system prompt roughly
+        prompt_tokens = sum(estimate_tokens(m["content"]) for m in session.messages)
+        session.prompt_tokens_processed += prompt_tokens
+        
+        # Deterministic offline response based purely on in-thread context
+        context_text = " ".join(m["content"].lower() for m in session.messages)
+        
+        if "tên" in message.lower() and "gì" in message.lower():
+            import re
+            name_match = re.search(r"(?:tên(?: là| mình là| tôi là)|tôi là)\s+([A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴa-záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵ\s]+)", context_text)
+            if name_match:
+                reply_text = f"Tên của bạn là {name_match.group(1).strip()}"
+            else:
+                reply_text = "Tôi không biết tên của bạn"
+        elif "nghề" in message.lower() and "gì" in message.lower():
+            import re
+            prof_match = re.search(r"(?:làm nghề|làm|nghề nghiệp là)\s+([A-ZÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴa-záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵ\s]+)", context_text)
+            if prof_match:
+                reply_text = f"Bạn làm nghề {prof_match.group(1).strip()}"
+            else:
+                reply_text = "Tôi không biết nghề của bạn"
+        elif "chào" in message.lower():
+            reply_text = "Chào bạn!"
+        elif "kể chuyện" in message.lower() or "dài" in message.lower():
+            reply_text = "Đây là một câu trả lời dài để test." * 10
+        else:
+            reply_text = "Tôi nhận được tin nhắn của bạn."
+            
+        session.messages.append({"role": "assistant", "content": reply_text})
+        reply_tokens = estimate_tokens(reply_text)
+        session.token_usage += reply_tokens
+        
+        return {"content": reply_text}
 
     def _maybe_build_langchain_agent(self):
-        """Student TODO: optionally wire `create_agent` + `InMemorySaver` here.
-
-        Use `build_chat_model(self.config.model)` so the baseline can run with any supported provider.
-        """
-
-        raise NotImplementedError
+        # Build simple chat model instead of full graph for direct API calls
+        return build_chat_model(self.config.model)
